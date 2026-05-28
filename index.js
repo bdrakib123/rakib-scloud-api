@@ -1,3 +1,5 @@
+require("dotenv").config();
+
 const express = require("express");
 const axios = require("axios");
 const cors = require("cors");
@@ -9,74 +11,186 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-// =======================
-// CLIENT ID CACHE
-// =======================
+// ======================================
+// AUTO CLIENT ID SYSTEM
+// ======================================
 
-let cachedClientId = null;
-let lastFetch = 0;
+let CLIENT_IDS = [];
+let LAST_UPDATE = 0;
 
-async function getClientId() {
+async function updateClientIds() {
   try {
-    // cache 1 hour
-    if (cachedClientId && Date.now() - lastFetch < 3600000) {
-      return cachedClientId;
+    // 6 hour cache
+    if (
+      CLIENT_IDS.length > 0 &&
+      Date.now() - LAST_UPDATE < 21600000
+    ) {
+      return CLIENT_IDS;
     }
 
-    const html = (await axios.get("https://soundcloud.com")).data;
+    console.log("🔄 Updating SoundCloud Client IDs...");
 
-    // js files
+    const html = (
+      await axios.get("https://soundcloud.com", {
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+        },
+        timeout: 20000
+      })
+    ).data;
+
     const scriptUrls = [
       ...html.matchAll(
         /https:\/\/a-v2\.sndcdn\.com\/assets\/.+?\.js/g
       )
     ].map(x => x[0]);
 
+    const ids = new Set();
+
     for (const url of scriptUrls) {
       try {
-        const js = (await axios.get(url)).data;
+        const js = (
+          await axios.get(url, {
+            headers: {
+              "User-Agent":
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+            },
+            timeout: 20000
+          })
+        ).data;
 
-        const match = js.match(/client_id:\s*"([a-zA-Z0-9]{32})"/);
+        const matches = [
+          ...js.matchAll(
+            /client_id:"([a-zA-Z0-9]{32})"/g
+          )
+        ];
 
-        if (match && match[1]) {
-          cachedClientId = match[1];
-          lastFetch = Date.now();
-
-          console.log("✅ New Client ID:", cachedClientId);
-
-          return cachedClientId;
-        }
+        matches.forEach(m => ids.add(m[1]));
 
       } catch {}
     }
 
-    throw new Error("Client ID not found");
+    CLIENT_IDS = [...ids];
+    LAST_UPDATE = Date.now();
+
+    console.log(
+      `✅ ${CLIENT_IDS.length} Client IDs Loaded`
+    );
+
+    return CLIENT_IDS;
 
   } catch (err) {
-    throw new Error("Failed to fetch client ID");
+    console.log("❌ Failed to update IDs");
+
+    if (CLIENT_IDS.length > 0) {
+      return CLIENT_IDS;
+    }
+
+    throw new Error("No Client IDs Available");
   }
 }
 
-// =======================
+async function getWorkingClientId() {
+  const ids = await updateClientIds();
+
+  for (const clientId of ids) {
+    try {
+      await axios.get(
+        "https://api-v2.soundcloud.com/search/tracks",
+        {
+          params: {
+            q: "test",
+            client_id: clientId,
+            limit: 1
+          },
+          timeout: 10000
+        }
+      );
+
+      return clientId;
+
+    } catch {}
+  }
+
+  throw new Error("No Working Client ID");
+}
+
+// ======================================
+// SEARCH TRACK
+// ======================================
+
+async function searchTrack(query, limit = 1) {
+  const clientId = await getWorkingClientId();
+
+  const response = await axios.get(
+    "https://api-v2.soundcloud.com/search/tracks",
+    {
+      params: {
+        q: query,
+        client_id: clientId,
+        limit
+      },
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        Accept: "application/json"
+      },
+      timeout: 15000
+    }
+  );
+
+  return {
+    tracks: response.data.collection,
+    clientId
+  };
+}
+
+// ======================================
+// GET AUDIO URL
+// ======================================
+
+async function getAudioUrl(track, clientId) {
+  const transcoding =
+    track.media.transcodings.find(
+      t => t.format.protocol === "progressive"
+    ) || track.media.transcodings[0];
+
+  const stream = await axios.get(
+    `${transcoding.url}?client_id=${clientId}`,
+    {
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+      },
+      timeout: 15000
+    }
+  );
+
+  return stream.data.url;
+}
+
+// ======================================
 // HOME
-// =======================
+// ======================================
 
 app.get("/", (req, res) => {
   res.json({
     status: true,
     creator: "Rakib",
-    message: "SoundCloud API Running"
+    message: "Advanced SoundCloud API Running",
+    loadedClientIds: CLIENT_IDS.length
   });
 });
 
-// =======================
+// ======================================
 // SEARCH API
-// =======================
+// ======================================
 
 app.get("/soundcloud/search", async (req, res) => {
   try {
     const query = req.query.q;
-    const limit = req.query.limit || 10;
+    const limit = parseInt(req.query.limit) || 10;
 
     if (!query) {
       return res.status(400).json({
@@ -85,20 +199,10 @@ app.get("/soundcloud/search", async (req, res) => {
       });
     }
 
-    const clientId = await getClientId();
-
-    const response = await axios.get(
-      "https://api-v2.soundcloud.com/search/tracks",
-      {
-        params: {
-          q: query,
-          client_id: clientId,
-          limit
-        }
-      }
+    const { tracks } = await searchTrack(
+      query,
+      limit
     );
-
-    const tracks = response.data.collection;
 
     if (!tracks.length) {
       return res.json({
@@ -112,8 +216,10 @@ app.get("/soundcloud/search", async (req, res) => {
       artist: track.user.username,
       duration: Math.floor(track.duration / 1000),
       artwork:
-        track.artwork_url?.replace("-large", "-t500x500") ||
-        track.user.avatar_url,
+        track.artwork_url?.replace(
+          "-large",
+          "-t500x500"
+        ) || track.user.avatar_url,
       url: track.permalink_url
     }));
 
@@ -126,14 +232,17 @@ app.get("/soundcloud/search", async (req, res) => {
   } catch (err) {
     res.status(500).json({
       status: false,
-      error: err.message
+      error:
+        err.response?.data ||
+        err.message ||
+        "Unknown error"
     });
   }
 });
 
-// =======================
+// ======================================
 // AUDIO API
-// =======================
+// ======================================
 
 app.get("/soundcloud/audio", async (req, res) => {
   try {
@@ -146,21 +255,10 @@ app.get("/soundcloud/audio", async (req, res) => {
       });
     }
 
-    const clientId = await getClientId();
+    const { tracks, clientId } =
+      await searchTrack(query, 1);
 
-    // Search first track
-    const search = await axios.get(
-      "https://api-v2.soundcloud.com/search/tracks",
-      {
-        params: {
-          q: query,
-          client_id: clientId,
-          limit: 1
-        }
-      }
-    );
-
-    const track = search.data.collection[0];
+    const track = tracks[0];
 
     if (!track) {
       return res.json({
@@ -169,15 +267,9 @@ app.get("/soundcloud/audio", async (req, res) => {
       });
     }
 
-    // Get stream URL
-    const transcoding =
-      track.media.transcodings.find(
-        t => t.format.protocol === "progressive"
-      ) ||
-      track.media.transcodings[0];
-
-    const stream = await axios.get(
-      `${transcoding.url}?client_id=${clientId}`
+    const audio = await getAudioUrl(
+      track,
+      clientId
     );
 
     res.json({
@@ -188,24 +280,29 @@ app.get("/soundcloud/audio", async (req, res) => {
         artist: track.user.username,
         duration: Math.floor(track.duration / 1000),
         artwork:
-          track.artwork_url?.replace("-large", "-t500x500") ||
-          track.user.avatar_url,
+          track.artwork_url?.replace(
+            "-large",
+            "-t500x500"
+          ) || track.user.avatar_url,
         url: track.permalink_url,
-        audio: stream.data.url
+        audio
       }
     });
 
   } catch (err) {
     res.status(500).json({
       status: false,
-      error: err.message
+      error:
+        err.response?.data ||
+        err.message ||
+        "Unknown error"
     });
   }
 });
 
-// =======================
+// ======================================
 // STREAM API
-// =======================
+// ======================================
 
 app.get("/soundcloud/stream", async (req, res) => {
   try {
@@ -218,21 +315,10 @@ app.get("/soundcloud/stream", async (req, res) => {
       });
     }
 
-    const clientId = await getClientId();
+    const { tracks, clientId } =
+      await searchTrack(query, 1);
 
-    // Search
-    const search = await axios.get(
-      "https://api-v2.soundcloud.com/search/tracks",
-      {
-        params: {
-          q: query,
-          client_id: clientId,
-          limit: 1
-        }
-      }
-    );
-
-    const track = search.data.collection[0];
+    const track = tracks[0];
 
     if (!track) {
       return res.json({
@@ -241,20 +327,20 @@ app.get("/soundcloud/stream", async (req, res) => {
       });
     }
 
-    const transcoding =
-      track.media.transcodings.find(
-        t => t.format.protocol === "progressive"
-      ) ||
-      track.media.transcodings[0];
-
-    const stream = await axios.get(
-      `${transcoding.url}?client_id=${clientId}`
+    const audioUrl = await getAudioUrl(
+      track,
+      clientId
     );
 
     const audioResponse = await axios({
-      url: stream.data.url,
+      url: audioUrl,
       method: "GET",
-      responseType: "stream"
+      responseType: "stream",
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+      },
+      timeout: 30000
     });
 
     res.setHeader("Content-Type", "audio/mpeg");
@@ -264,15 +350,34 @@ app.get("/soundcloud/stream", async (req, res) => {
   } catch (err) {
     res.status(500).json({
       status: false,
-      error: err.message
+      error:
+        err.response?.data ||
+        err.message ||
+        "Unknown error"
     });
   }
 });
 
-// =======================
-// START SERVER
-// =======================
+// ======================================
+// AUTO REFRESH IDS
+// ======================================
 
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+setInterval(async () => {
+  try {
+    await updateClientIds();
+  } catch {}
+}, 21600000);
+
+// ======================================
+// START SERVER
+// ======================================
+
+app.listen(PORT, async () => {
+  console.log(`🚀 Server running on ${PORT}`);
+
+  try {
+    await updateClientIds();
+  } catch (err) {
+    console.log("❌ Initial ID Load Failed");
+  }
 });
